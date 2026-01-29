@@ -8,7 +8,7 @@
  *   - TTL support
  *   - Thread-safe
  * 
- * License: MIT
+ * License: read LICENSE
  */
 #ifndef HINOTETSU_H
 #define HINOTETSU_H

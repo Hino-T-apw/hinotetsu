@@ -7,6 +7,8 @@
  * Compile:
  *   gcc -O3 -o hinotetsud hinotetsud.c hinotetsu.c -lpthread
  */
+// License: BUSL (Business Source License)
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,8 +19,9 @@
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <pthread.h>
-//#include "hinotetsu2.h"
-#include "hinotetsu.h"
+#include "hinotetsu2.h"
+#include <sys/uio.h>   // writev
+//#include "hinotetsu.h"
 
 #define DEFAULT_PORT 11211
 #define DEFAULT_MEMORY_MB 64
@@ -69,29 +72,69 @@ void handle_set(Client *c, const char *line) {
     c->buf[c->buf_len] = '\0';
 }
 
-
 void handle_get(Client *c, char *line) {
     char key[256];
     if (sscanf(line, "get %250s", key) != 1) {
         send_response(c->fd, "CLIENT_ERROR bad command\r\n"); return;
     }
-    
-    char *value; size_t vlen;
-    hinotetsu_lock(g_db);
-    int ret = hinotetsu_get(g_db, key, strlen(key), &value, &vlen);
-    hinotetsu_unlock(g_db);
-    
-    if (ret == HINOTETSU_OK) {
-        char header[512];
-        snprintf(header, sizeof(header), "VALUE %s 0 %zu\r\n", key, vlen);
-        send_response(c->fd, header);
-        write(c->fd, value, vlen);
-        send_response(c->fd, "\r\nEND\r\n");
-        free(value);
-    } else {
-        send_response(c->fd, "END\r\n");
+
+    // thread-local buffer (1 per client thread)
+    static __thread char *tls_buf = NULL;
+    static __thread size_t tls_cap = 0;
+
+    size_t need = 0;
+    int ret;
+
+    // まずは現capで試す（足りなければ拡張して再試行）
+    if (tls_cap == 0) {
+        tls_cap = 4096;
+        tls_buf = (char*)malloc(tls_cap);
+        if (!tls_buf) { send_response(c->fd, "SERVER_ERROR out of memory\r\n"); return; }
     }
+
+    hinotetsu_lock(g_db);
+    ret = hinotetsu_get_into(g_db, key, strlen(key), tls_buf, tls_cap, &need);
+    hinotetsu_unlock(g_db);
+
+    if (ret == HINOTETSU_ERR_TOOSMALL) {
+        // grow to need (round up)
+        size_t new_cap = tls_cap;
+        while (new_cap < need) new_cap <<= 1;
+        char *nb = (char*)realloc(tls_buf, new_cap);
+        if (!nb) { send_response(c->fd, "SERVER_ERROR out of memory\r\n"); return; }
+        tls_buf = nb;
+        tls_cap = new_cap;
+
+        hinotetsu_lock(g_db);
+        ret = hinotetsu_get_into(g_db, key, strlen(key), tls_buf, tls_cap, &need);
+        hinotetsu_unlock(g_db);
+    }
+
+    if (ret != HINOTETSU_OK) {
+        send_response(c->fd, "END\r\n");
+        return;
+    }
+
+    // VALUE header
+    char header[512];
+    int hlen = snprintf(header, sizeof(header), "VALUE %s 0 %zu\r\n", key, need);
+    if (hlen <= 0) { send_response(c->fd, "SERVER_ERROR\r\n"); return; }
+
+    // writev: header + value + "\r\nEND\r\n"
+    static const char trailer[] = "\r\nEND\r\n";
+    struct iovec iov[3];
+    iov[0].iov_base = header;
+    iov[0].iov_len  = (size_t)hlen;
+    iov[1].iov_base = tls_buf;
+    iov[1].iov_len  = need;
+    iov[2].iov_base = (void*)trailer;
+    iov[2].iov_len  = sizeof(trailer) - 1;
+
+    // best-effort writev
+    ssize_t w = writev(c->fd, iov, 3);
+    (void)w;
 }
+
 
 void handle_delete(Client *c, char *line) {
     char key[256];
