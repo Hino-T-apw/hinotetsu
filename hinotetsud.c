@@ -32,24 +32,42 @@ typedef struct { int fd; char buf[BUFFER_SIZE]; size_t buf_len; } Client;
 
 void send_response(int fd, const char *msg) { write(fd, msg, strlen(msg)); }
 
-void handle_set(Client *c, char *line) {
+void handle_set(Client *c, const char *line) {
     char key[256]; int flags, exptime, bytes;
+
     if (sscanf(line, "set %250s %d %d %d", key, &flags, &exptime, &bytes) != 4) {
-        send_response(c->fd, "CLIENT_ERROR bad command line format\r\n"); return;
+        send_response(c->fd, "CLIENT_ERROR bad command line format\r\n");
+        return;
     }
+
+    // ★ 異常値ガード（超重要：ここが無いと segfault しやすい）
+    if (bytes < 0 || bytes > (int)BUFFER_SIZE) {
+        send_response(c->fd, "CLIENT_ERROR bad data chunk\r\n");
+        return;
+    }
+
     if (c->buf_len < (size_t)bytes + 2) {
-        send_response(c->fd, "CLIENT_ERROR not enough data\r\n"); return;
+        send_response(c->fd, "CLIENT_ERROR not enough data\r\n");
+        return;
     }
-    
+
     hinotetsu_lock(g_db);
-    int ret = hinotetsu_set(g_db, key, strlen(key), c->buf, bytes, exptime);
+    int ret = hinotetsu_set(g_db, key, strlen(key), c->buf, (size_t)bytes, exptime);
     hinotetsu_unlock(g_db);
-    
+
     send_response(c->fd, ret == HINOTETSU_OK ? "STORED\r\n" : "SERVER_ERROR out of memory\r\n");
-    size_t consumed = bytes + 2;
+
+    size_t consumed = (size_t)bytes + 2;
+    if (consumed > c->buf_len) { // ★ 念のため
+        c->buf_len = 0;
+        c->buf[0] = '\0';
+        return;
+    }
     memmove(c->buf, c->buf + consumed, c->buf_len - consumed);
     c->buf_len -= consumed;
+    c->buf[c->buf_len] = '\0';
 }
+
 
 void handle_get(Client *c, char *line) {
     char key[256];
@@ -123,17 +141,39 @@ int process_command(Client *c) {
     *newline = '\0';
     char *line = c->buf;
     size_t line_len = newline - c->buf + 2;
+    //fprintf(stderr, "LINE='%s'\n", line);
     
     if (strncmp(line, "set ", 4) == 0) {
-        int bytes;
+        int bytes = -1;
         if (sscanf(line, "set %*s %*d %*d %d", &bytes) == 1) {
-            if (c->buf_len < line_len + bytes + 2) { *newline = '\r'; return 0; }
+            if (bytes < 0 || bytes > (int)BUFFER_SIZE) {
+                send_response(c->fd, "CLIENT_ERROR bad data chunk\r\n");
+                memmove(c->buf, c->buf + line_len, c->buf_len - line_len);
+                c->buf_len -= line_len;
+                c->buf[c->buf_len] = '\0';
+                return 1;
+            }
+            if (c->buf_len < line_len + (size_t)bytes + 2) {
+                *newline = '\r';
+                return 0;
+            }
         }
+
+        // ★ memmove 前に set 行をコピー（これが本丸）
+        char line_copy[1024];
+        size_t copy_len = (size_t)(newline - c->buf); // "\r\n" の直前まで
+        if (copy_len >= sizeof(line_copy)) copy_len = sizeof(line_copy) - 1;
+        memcpy(line_copy, c->buf, copy_len);
+        line_copy[copy_len] = '\0';
+
+        // 行部分を先にバッファから落とす（残り先頭が data になる）
         memmove(c->buf, c->buf + line_len, c->buf_len - line_len);
         c->buf_len -= line_len;
-        handle_set(c, line);
-    }
-    else if (strncmp(line, "get ", 4) == 0) {
+        c->buf[c->buf_len] = '\0';
+
+        // コピーした行で処理（lineが壊れない）
+        handle_set(c, line_copy);
+    }else if (strncmp(line, "get ", 4) == 0) {
         handle_get(c, line);
         memmove(c->buf, c->buf + line_len, c->buf_len - line_len); c->buf_len -= line_len;
     }
