@@ -5,7 +5,7 @@
 // - Per-shard bump allocator for metadata/keys/pages
 // - Per-shard slab allocator for VALUES (reuse on overwrite/delete)
 // - GET copies out of lock (pointer+len captured under lock)
-
+// License: BUSL (Business Source License)
 #include "hinotetsu2.h"
 
 #include <pthread.h>
