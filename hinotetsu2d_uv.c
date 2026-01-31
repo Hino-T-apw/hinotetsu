@@ -49,7 +49,11 @@
 #endif
 
 #ifndef WRITE_BUF_INIT_CAP
-#define WRITE_BUF_INIT_CAP (128 * 1024)
+#define WRITE_BUF_INIT_CAP (512 * 1024)
+#endif
+
+#ifndef FLUSH_THRESHOLD
+#define FLUSH_THRESHOLD (256 * 1024)
 #endif
 
 // -----------------------------
@@ -205,10 +209,11 @@ struct Conn {
   size_t in_len;
   size_t in_cap;
 
-  // Output buffer (batched writes)
-  char* outbuf;
+  // Double-buffered output (swap on flush)
+  char* outbuf[2];
   size_t out_len;
   size_t out_cap;
+  int out_active;  // which buffer is being written (0 or 1)
 
   // Pending set state
   int pending_set;
@@ -228,19 +233,29 @@ static void conn_flush_output(Conn* c);
 static void on_closed(uv_handle_t* handle);
 
 // -----------------------------
-// Output buffering
+// Output buffering (double-buffered)
 // -----------------------------
 static void conn_append_output(Conn* c, const char* data, size_t len) {
   if (c->closing) return;
 
+  int idx = c->writing ? (1 - c->out_active) : c->out_active;
+  char** buf = &c->outbuf[idx];
+
   if (c->out_len + len > c->out_cap) {
     size_t cap = c->out_cap ? c->out_cap : WRITE_BUF_INIT_CAP;
     while (cap < c->out_len + len) cap <<= 1;
-    c->outbuf = (char*)xrealloc(c->outbuf, cap);
+    // Grow both buffers to same size
+    c->outbuf[0] = (char*)xrealloc(c->outbuf[0], cap);
+    c->outbuf[1] = (char*)xrealloc(c->outbuf[1], cap);
     c->out_cap = cap;
   }
-  memcpy(c->outbuf + c->out_len, data, len);
+  memcpy(*buf + c->out_len, data, len);
   c->out_len += len;
+
+  // Flush when threshold reached
+  if (c->out_len >= FLUSH_THRESHOLD && !c->writing) {
+    conn_flush_output(c);
+  }
 }
 
 static void conn_append_str(Conn* c, const char* s) {
@@ -259,7 +274,7 @@ static void write_cb(uv_write_t* req, int status) {
     return;
   }
 
-  // More data accumulated while writing?
+  // If data accumulated in the other buffer while writing, flush it
   if (c->out_len > 0) {
     conn_flush_output(c);
   }
@@ -268,20 +283,22 @@ static void write_cb(uv_write_t* req, int status) {
 static void conn_flush_output(Conn* c) {
   if (c->closing || c->writing || c->out_len == 0) return;
 
-  uv_buf_t b = uv_buf_init(c->outbuf, (unsigned int)c->out_len);
+  int idx = c->out_active;
+  uv_buf_t b = uv_buf_init(c->outbuf[idx], (unsigned int)c->out_len);
+
   c->writing = 1;
+  c->out_active = 1 - idx;  // Swap to other buffer
+  size_t written_len = c->out_len;
+  c->out_len = 0;  // Reset length for new buffer
 
   int rc = uv_write(&c->write_req, (uv_stream_t*)&c->tcp, &b, 1, write_cb);
   if (rc != 0) {
     c->writing = 0;
+    c->out_len = written_len;  // Restore on error
+    c->out_active = idx;
     c->closing = 1;
     uv_close((uv_handle_t*)&c->tcp, on_closed);
-    return;
   }
-
-  // Reset output buffer (data is copied by libuv? No - we need to keep it!)
-  // Actually libuv does NOT copy, so we swap buffers
-  c->out_len = 0;
 }
 
 // -----------------------------
@@ -290,7 +307,8 @@ static void conn_flush_output(Conn* c) {
 static void close_conn(Conn* c) {
   if (!c) return;
   if (c->inbuf) free(c->inbuf);
-  if (c->outbuf) free(c->outbuf);
+  if (c->outbuf[0]) free(c->outbuf[0]);
+  if (c->outbuf[1]) free(c->outbuf[1]);
   free(c);
 }
 
@@ -307,13 +325,12 @@ static void alloc_cb(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) 
   buf->len = (unsigned int)n;
 }
 
-// -----------------------------
-// Command handlers (direct execution)
+// Command handlers (direct execution, no locks)
 // -----------------------------
 static void handle_set(Conn* c, const char* key, int flags, int exptime, const char* value, size_t vlen) {
   (void)flags;
-  int ret = hinotetsu_set(g_db, key, strlen(key), value, vlen,
-                          (uint32_t)(exptime < 0 ? 0 : exptime));
+  int ret = hinotetsu_set_nolock(g_db, key, strlen(key), value, vlen,
+                                 (uint32_t)(exptime < 0 ? 0 : exptime));
   conn_append_str(c, ret == HINOTETSU_OK ? "STORED\r\n" : "SERVER_ERROR out of memory\r\n");
 }
 
@@ -325,7 +342,7 @@ static void handle_get(Conn* c, const char* key) {
     return;
   }
 
-  int ret = hinotetsu_get_into(g_db, key, strlen(key), buf, g_get_buf_cap, &need);
+  int ret = hinotetsu_get_into_nolock(g_db, key, strlen(key), buf, g_get_buf_cap, &need);
 
   if (ret == HINOTETSU_ERR_TOOSMALL) {
     buf = ensure_get_buf(need);
@@ -333,7 +350,7 @@ static void handle_get(Conn* c, const char* key) {
       conn_append_str(c, "SERVER_ERROR out of memory\r\n");
       return;
     }
-    ret = hinotetsu_get_into(g_db, key, strlen(key), buf, g_get_buf_cap, &need);
+    ret = hinotetsu_get_into_nolock(g_db, key, strlen(key), buf, g_get_buf_cap, &need);
   }
 
   if (ret != HINOTETSU_OK) {
@@ -354,13 +371,13 @@ static void handle_get(Conn* c, const char* key) {
 }
 
 static void handle_delete(Conn* c, const char* key) {
-  int ret = hinotetsu_delete(g_db, key, strlen(key));
+  int ret = hinotetsu_delete_nolock(g_db, key, strlen(key));
   conn_append_str(c, ret == HINOTETSU_OK ? "DELETED\r\n" : "NOT_FOUND\r\n");
 }
 
 static void handle_stats(Conn* c) {
   HinotetsuStats st;
-  hinotetsu_stats(g_db, &st);
+  hinotetsu_stats_nolock(g_db, &st);
 
   char buf[2048];
   int n = snprintf(buf, sizeof(buf),
@@ -388,7 +405,7 @@ static void handle_stats(Conn* c) {
 }
 
 static void handle_flush(Conn* c) {
-  hinotetsu_flush(g_db);
+  hinotetsu_flush_nolock(g_db);
   conn_append_str(c, "OK\r\n");
 }
 
@@ -552,11 +569,25 @@ static void on_new_conn(uv_stream_t* server, int status) {
   if (!c->inbuf) { free(c); return; }
 
   c->out_cap = WRITE_BUF_INIT_CAP;
-  c->outbuf = (char*)malloc(c->out_cap);
-  if (!c->outbuf) { free(c->inbuf); free(c); return; }
+  c->outbuf[0] = (char*)malloc(c->out_cap);
+  c->outbuf[1] = (char*)malloc(c->out_cap);
+  if (!c->outbuf[0] || !c->outbuf[1]) {
+    if (c->outbuf[0]) free(c->outbuf[0]);
+    if (c->outbuf[1]) free(c->outbuf[1]);
+    free(c->inbuf);
+    free(c);
+    return;
+  }
+  c->out_active = 0;
 
   uv_tcp_init(uv_default_loop(), &c->tcp);
   c->tcp.data = c;
+
+  // TCP optimizations
+  uv_tcp_nodelay(&c->tcp, 1);
+
+  // Increase send buffer size (reduces write blocking)
+  uv_send_buffer_size((uv_handle_t*)&c->tcp, &(int){1024 * 1024});
 
   if (uv_accept(server, (uv_stream_t*)&c->tcp) == 0) {
     uv_read_start((uv_stream_t*)&c->tcp, alloc_cb, read_cb);
