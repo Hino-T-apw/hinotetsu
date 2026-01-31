@@ -1,0 +1,1 @@
+gcc -O3 -std=c11 -o hinotetsu3d hinotetsu3d.c hinotetsu3.c -luv -lpthread
