@@ -1,0 +1,10 @@
+.claude
+test
+test/build
+benchmark
+benchmark/bench_pipeline
+test/build/hinotetsu3.o
+test/build/test_basic
+test/build/test_stress
+test/build/test_ttl
+hinotetsu2d_uv
